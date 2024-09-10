@@ -139,6 +139,12 @@ class AWQMarlinLinearMethod(LinearMethodBase):
     def __init__(self, quant_config: AWQMarlinConfig) -> None:
         self.quant_config = quant_config
 
+    # 在 loader 的 loadmodel 中，调用_initialize_model，获取到特定模型(如qwen2.py)，在其初始化时需要创建各计算层，其中包含有Attention。
+    # 而 create_weights 在 layer.py 的 Attention.__init__ 中被调用。
+    # 参数：
+    # input_size_per_partition: 在rank X上的权重输入维度.
+    # output_partition_sizes: rank X上每个逻辑权重的输出维度的大小。例如，QKVLinear的output_partition_Sizes是一个包含rank X上Wq、Wk、Wv宽度的列表。
+    # quant_config.pack_factor = 32 // weight_bits，因为权重是int4，而safetensor中存储是以int32存储的，所以pack_factor=32/4=8， 表示现权重tensor里一个元素表示8个实际权重值
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -159,6 +165,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         else:
             group_size = input_size
 
+        # 需要满足一些整除的条件，可省略边缘处理？
         verify_marlin_supports_shape(
             output_size_per_partition=output_size_per_partition,
             input_size_per_partition=input_size_per_partition,
@@ -212,6 +219,12 @@ class AWQMarlinLinearMethod(LinearMethodBase):
     # Checkpoints are serialized in AutoAWQ format, which is different from the
     # marlin format. This function is called after the weights are loaded.
     # Here, we handle the repacking
+    
+    # 在 loader 的 loadmodel 中，调用完_initialize_model和model.load_weights后，
+    # 进一步判断使用的量化后端是否需要额外处理权重时，该函数被被调用(model_executor\model_loader\loader.py#360)
+    # 将awq格式转换为marlin格式:
+    #   
+    
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         device = layer.qweight.device
         layer.qweight = torch.nn.Parameter(layer.qweight.data,
@@ -221,7 +234,7 @@ class AWQMarlinLinearMethod(LinearMethodBase):
         layer.scales = torch.nn.Parameter(layer.scales.data,
                                           requires_grad=False)
 
-        # Allocate marlin workspace
+        # Allocate marlin workspace，额外的全局内存，在规约时用作屏障同步
         layer.workspace = marlin_make_workspace(
             layer.output_size_per_partition, device)
 

@@ -18,6 +18,8 @@ from vllm.utils import async_tensor_h2d, make_tensor_with_pad
 if TYPE_CHECKING:
     from vllm.worker.model_runner import ModelInputForGPUBuilder
 
+# 这里是通过pip install vllm_flash_attn安装得到的，是官方flash-attention的vllm维护版本，
+# 具体函数实现可以查看 https://github.com/Dao-AILab/flash-attention 
 from vllm_flash_attn import flash_attn_varlen_func as _flash_attn_varlen_func
 from vllm_flash_attn import flash_attn_with_kvcache as _flash_attn_with_kvcache
 

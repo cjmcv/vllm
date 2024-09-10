@@ -19,6 +19,20 @@
  * Adapted from https://github.com/IST-DASLab/marlin
  */
 
+// marlin kernel实现的是一个fp16 A x int4/int8 B = fp16 C的混合精度的gemm.
+// 主要围绕着16x8x16的fp16 mma进行计算，即一次mma为A[16,16] x B[16,8] = C[16,8]。
+// 子块划分为[16,16]，按n方向两次mma来完成A[16,16] x B[16,16] = C[16,16]
+
+// 以int4为例:
+// 1. 在模型加载后，权重矩阵 B 会做一次repack：
+//     1) 针对[16, 16]分块, 将维度排布成[k/16, n*16]，使16x16子块排成一行。用途？
+//     2) 将子块元素按列混插方式排布，因为gemm里采用的是fp16计算，而B矩阵是int4，
+//         在计算之前会涉及到反量化操作，需要对用int32存储的8个int4分别进行拼凑，
+//         则需要将相邻的两个int4分别划分到高16位和低16位中，便于在mask后直接进反量化操作。
+//     3) 因为B矩阵是int4，涉及到unpack和反量化，无法使用ldmatrix进行读取，
+//         所以将子块元素顺序进行按ldmatrix B矩阵的格式进行排布，达到ldmatrix.trans的效果，在反量化后可直接用到mma中。
+// 2. gemm
+
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
 #include "core/scalar_type.hpp"
@@ -88,6 +102,30 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
 
 #else
 
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-fragment-mma-16816-float
+// mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 
+// 表示计算C[16,8]+A[16,16]*B[16,8]=C[16,8], 类型f32.f16.f16.f32，分别对应C,A,B,C。
+// 而a_frag里一个元素是4个16x2的Vec，frag_b里一个元素是2个16x2的Vec, frag_c是4个float的Vec。
+// 
+//    针对A矩阵而言，共16x16个数据，warp有32个线程，则每个线程需要负责写入8个fp16数据，需要4个32位寄存器。
+// t0([0,0], [0,1], [8,0], [8,1], [0,8], [0,9], [8,8], [8,9]), t1([0,2], [0,3], [8,2], [8,3], [0,10], [0,11], [8,10], [8,11])
+// t2/t3略，t4([1,0], [1,1], [9,0], [9,1], [1,8], [1,9], [9,8], [9,9])
+//    针对B矩阵而言，共16x8个数据，每个线程需要负责写入4个fp16数据，需要2个32位寄存器。
+// t0([0,0], [1,0], [8,0], [9,0]),  t1([2,0], [3,0], [10,0], [11,0]), t2 略，t3([6,0], [7,0], [14,0], [15,0])
+// t4([0,1], [1,1], [8,1], [9,1])...
+// B矩阵的写入是按列优先的。上下分两组写入
+//    针对C矩阵而言，共16x8个数据，每个线程需要负责写入4个fp32数据，需要4个32位寄存器。
+// t0([0,0], [0,1], [8,0], [8,1]),  t1([0,2], [0,3], [8,2], [8,3]), t2/t3 略，t4([1,0], [1,1], [9,0], [9,1])
+//
+// A和C矩阵的写入是按行优先的，A矩阵按十字切分4份8x8，一个线程先写左上2个元素，左下2个，右上再右下，共8个数据。
+// C矩阵写法与A矩阵一致，但C矩阵列方向少了一半数据为上下2份8*8，先写左上2数据，再写左下2数据，共4个。
+// B矩阵按列优先写入，同分上下两块，先写上面的2数据，再写下面2数据，先递增列。
+//
+// 以t0为例，将会得到A矩阵的[0,0], [0,1], [8,0], [8,1], [0,8], [0,9], [8,8], [8,9]
+//                  B矩阵的[0,0], [1,0], [8,0], [9,0]
+//                  C矩阵的[0,0], [0,1], [8,0], [8,1]
+// A和B的数据并不能直接计算得到C的数据。为什么数据这么排布，原因在于该指令会跟ldmatrix进行搭配使用，ldmatrix读取出来后可以直接进入mma指令。
+// 
 // m16n8k16 tensor core mma instruction with fp16 inputs and fp32
 // output/accumulation.
 template <typename scalar_t>
@@ -116,6 +154,28 @@ __device__ inline void mma(const typename ScalarType<scalar_t>::FragA& a_frag,
   }
 }
 
+// https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#warp-level-matrix-instructions-ldmatrix
+
+// ldmatrix.sync.aligned.m8n8.x4.shared.b16 
+//   warp级别的加载矩阵指令，有同步指令和内存对齐的特点，加载的是16位8x8的矩阵，x4表示加载4份，即4个16位8x8的矩阵。
+//
+//   4个出参为4个32位寄存器（FragA是4个16x2的Vec，即有4个fp32的寄存器）
+// 对于其中一个出参而言，一个warp有32个线程，共读取8x8=64个元素，则分到这个线程的数据就刚好2个fp16，
+// 即刚好是一个fp32的寄存器，所以当前线程提供一个fp32寄存器用作出参即可。x4则提供4个fp32寄存器。
+// x1时: 8行32个线程，t0-t3获得t0提供的输入地址的8个fp16数据，1个线程2个数据；t4-t7获得t1输入地址的8个数据。。。
+//       (t0将拿到[0,0][0,1]，t1([0,2][0,3])...t3([0,6][0,7]), t4([1,0][1,1])... t31([7,6][7,7])) 
+//       与 mma中行优先的A和C矩阵一个线程读取的8x8子块内的顺序是一样的！所以可以用完ldmatrix后直接进入mma指令。
+//       对于B矩阵只需要用 ldmatrix.sync.aligned.m8n8.x1.trans.shared.b16
+//       需要注意bank冲突，t0读取0号32位数据, 属于bank0, 假设共享内存大小为32x32，则t4访问的也是bank0.
+// x4时: t0获得t0提供的输入地址的8个数据，t1获得t1输入地址的8个数据。。。
+//       (假设4个8x8矩阵被排列成32x8，t0-t31提供每行首地址) 则t0将拿到a0a1..a7, t1拿到a8-a15, ...每个寄存器的数据顺序同x1，
+//       (假设4个8x8矩阵被排列成16x16，t0-t16提供每行首地址，t16-t31提供每行右半边首地址) 则t0将拿到a0a1..a7，t16拿到a8-a15，t1拿到a16-a23了。
+//
+//   1个入参用于设置读取数据的首地址，因为读取的矩阵数据列是连续的，但行不是连续的，所以需要提供每一行的首地址。
+// 这里读取的矩阵是4个8x8，即需要提供4x8=32个首地址，一个warp有32个线程，每个线程都会调用到这个指令，
+// 指令约定t0-t31来分别提供这32个首地址，通过每个线程的%4输入
+//（x1指令：则约定t0-t7来提供8个首地址；x2则约定t0-t15来提供16个首地址）。
+// 
 // Instruction for loading a full 16x16 matrix fragment of operand A from shared
 // memory, directly in tensor core layout.
 template <typename scalar_t>
@@ -128,6 +188,8 @@ __device__ inline void ldsm4(typename ScalarType<scalar_t>::FragA& frag_a,
                : "r"(smem));
 }
 
+// 如实现 res=(a&b)|c, 则lut=(0xf0 & 0xcc) | 0xaa
+// 同理如实现 res=(a|b)&c, 则lut=(0xf0 | 0xcc) & 0xaa
 // Lookup-table based 3-input logical operation; explicitly used for
 // dequantization as the compiler does not seem to automatically recognize it in
 // all cases.
@@ -140,6 +202,8 @@ __device__ inline int lop3(int a, int b, int c) {
   return res;
 }
 
+// prmt.b32{.mode}  d, a, b, c;
+// 详见 dequant<half, vllm::kU8.id()>(int q)
 // Constructs destination register by taking bytes from 2 sources (based on
 // mask)
 template <int start_byte, int mask>
@@ -211,20 +275,33 @@ dequant<nv_bfloat16, vllm::kU4B8.id()>(int q) {
   return frag_b;
 }
 
+// uint4转fp16
+// 输入参数q为 i4s = {e7,e5,e3,e1,e6,e4,e2,e0}，奇数位放在高位，偶数位放在低位
+// 将4个int4 e3,e1,e2,e0 分别转换成 4个fp16
+// 对于 e7,e5,e6,e4 可以将i4s右移8位，得到 {0,0,e7,e5,e3,e1,e6,e4}, 使用0x000f000f和0x00f000f0则可以取出e7,e5,e6,e4
 template <>
 __device__ inline typename ScalarType<half>::FragB
 dequant<half, vllm::kU4.id()>(int q) {
   const int LO = 0x000f000f;
   const int HI = 0x00f000f0;
-  const int EX = 0x64006400;
+  const int EX = 0x64006400; // (0 11001 0000000000) (0 11001 0000000000)
   // Guarantee that the `(a & b) | c` operations are LOP3s.
+  // (i4s & 0x000f000f) | 0x64006400
+  // 取出 e1和e0 并分别和0x6400做或运算。随后还要再分别减去1024，即可完成转换。
+  // 假设q未预先按交织排布，即为{e7,e6,e5,e4,e3,e2,e1,e0}, 使用 0x000000ff 取出 e1e0，
+  // 因e1和e0两个数据紧挨在一起，无法分别和0x6400做或运算转换e1和e0的fp16，所以必要先是交织列格式才行。
   int lo = lop3<(0xf0 & 0xcc) | 0xaa>(q, LO, EX);
+  // (i4s & 0x00f000f0) | 0x64006400 
+  // 取出 e3和e2 并分别和0x6400做或运算。
+  // 假设e3为 0110 即为6, 但在原数据上表现为0110 0000, 
+  // 进行或运算后的fp16格式为 0 11001 0001100000 => 2^(25-15)*(1+(96/2^10))=1024*1.09375=1120
+  // 1120 * 0.0625 - 64 = 6
   int hi = lop3<(0xf0 & 0xcc) | 0xaa>(q, HI, EX);
 
-  const int SUB = 0x64006400;
-  const int MUL = 0x2c002c00;
-  const int ADD = 0xd400d400;
-  typename ScalarType<half>::FragB frag_b;
+  const int SUB = 0x64006400; // (0 11001 0000000000) (0 11001 0000000000) 11001 = 25, 2^(25-15)=2^10=1024
+  const int MUL = 0x2c002c00; // (0 01011 0000000000) (0 01011 0000000000) 01011 = 11，2^(11-15)=2^-4=1/16=0.0625
+  const int ADD = 0xd400d400; // (1 10101 0000000000) (1 10101 0000000000) 10101 = 21, 2^(21-15)=2^6=64, 符号位为1，即-64
+  typename ScalarType<half>::FragB frag_b; // 2个fp16x2, 共64位, 4个fp16
   frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
                       *reinterpret_cast<const half2*>(&SUB));
   frag_b[1] = __hfma2(*reinterpret_cast<half2*>(&hi),
@@ -318,15 +395,27 @@ dequant<nv_bfloat16, vllm::kU8B128.id()>(int q) {
 template <>
 __device__ inline typename ScalarType<half>::FragB
 dequant<half, vllm::kU8.id()>(int q) {
-  static constexpr uint32_t mask_for_elt_01 = 0x5250;
-  static constexpr uint32_t mask_for_elt_23 = 0x5351;
-  static constexpr uint32_t start_byte_for_fp16 = 0x64646464;
+  static constexpr uint32_t mask_for_elt_01 = 0x5250; // 0000 0000 0000 0000 0101 0010 0101 0000
+  static constexpr uint32_t mask_for_elt_23 = 0x5351; // 0000 0000 0000 0000 0101 0011 0101 0001
+  static constexpr uint32_t start_byte_for_fp16 = 0x64646464; // 0110 0100 0110 0100 0110 0100 0110 0100
 
+  // 假设q为4个int8，如1,2,3,4, 即为 (0000 0100) (0000 0011) (0000 0010) (0000 0001)
+  // 将b和a拼接在一起，即 start_byte_for_fp16和q，得到
+  // {q, start_byte_for_fp16}： 0110 0100 0110 0100 0110 0100 0110 0100   0000 0100 0000 0011 0000 0010 0000 0001
+  //                               b7        b6        b5        b4          b3         b2        b1       b0
+  // 最后通过mask来选择，首先第一个是0x5250, 
+  //  第一个byte是0000，选择b0，为 0000 0001; 第二个byte是0101，选择b5，为 0110 0100;
+  //  第三个byte是0010，选择b2，为 0000 0011; 第四个byte是0101，选择b5，为 0110 0100;
+  //  最后得到 b5 b2 b5 b0: 0110 0100 0000 0011 0110 0100 0000 0001，
+  //  按两个fp16划分: 0 11001 0000000011 和 0 11001 0000000001，分别为2^(25-15)x(1+3/1024) = 1027; 2^(25-15)x(1+1/1024) = 1025
+  // 同理第二个mask 0x5351，对应b5 b3 b5 b1: 2^(25-15)x(1+4/1024) = 1028; 2^(25-15)x(1+2/1024) = 1026;
   uint32_t lo = prmt<start_byte_for_fp16, mask_for_elt_01>(q);
   uint32_t hi = prmt<start_byte_for_fp16, mask_for_elt_23>(q);
 
-  static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64006400;
+  static constexpr uint32_t I8s_TO_F16s_MAGIC_NUM = 0x64006400; // (0 11001 0000000000) (0 11001 0000000000)
 
+  // 1027和1025分别减去magic num，即1024，得到2和1。
+  // 1028和1026分别减去magic num，得到4和3。完成转换。
   typename ScalarType<half>::FragB frag_b;
   frag_b[0] = __hsub2(*reinterpret_cast<half2*>(&lo),
                       *reinterpret_cast<const half2*>(&I8s_TO_F16s_MAGIC_NUM));
@@ -527,7 +616,7 @@ __global__ void Marlin(
     const int4* __restrict__ scales_ptr,  // fp16 quantization scales of shape
                                           // (k/groupsize)xn
     const int4* __restrict__ zp_ptr,      // 4bit packed zero-points of shape
-                                          // (k/groupsize)x(n/pack_factor)
+                                          // (k/groupsize)x(n/pack_factor), 因为zero points也是int4，原n表示的是int4的元素个数，需要除以8才是int32的个数
     const int* __restrict__ g_idx,        // int32 group indices of shape k
     int num_groups,       // number of scale groups per output channel
     int prob_m,           // batch dimension m
@@ -549,18 +638,19 @@ __global__ void Marlin(
   // reductions as possible.
   using Dtype = ScalarType<scalar_t>;
   using scalar_t2 = typename ScalarType<scalar_t>::scalar_t2;
-  using FragA = typename ScalarType<scalar_t>::FragA;
-  using FragB = typename ScalarType<scalar_t>::FragB;
-  using FragC = typename ScalarType<scalar_t>::FragC;
-  using FragS = typename ScalarType<scalar_t>::FragS;
-  using FragZP = typename ScalarType<scalar_t>::FragZP;
+  using FragA = typename ScalarType<scalar_t>::FragA;   // 4个fp16x2
+  using FragB = typename ScalarType<scalar_t>::FragB;   // 2个fp16x2
+  using FragC = typename ScalarType<scalar_t>::FragC;   // 4个fp32
+  using FragS = typename ScalarType<scalar_t>::FragS;   // 1个fp16x2
+  using FragZP = typename ScalarType<scalar_t>::FragZP; // 4个fp16x2
 
-  static constexpr auto w_type = vllm::ScalarType::from_id(w_type_id);
+  static constexpr auto w_type = vllm::ScalarType::from_id(w_type_id); // 权重类型，这里是int4
 
-  constexpr int pack_factor = 32 / w_type.size_bits();
+  constexpr int pack_factor = 32 / w_type.size_bits(); // 4bit，pack_factor=8，用于int4和int32的索引下标转换
 
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a
   // better partitioning with less reductions
+  // 在m维度上进行拆分，
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
     parallel = prob_m / (16 * thread_m_blocks);
@@ -1877,6 +1967,7 @@ exec_config_t determine_thread_config(int prob_m, int prob_n, int prob_k,
                                       int max_shared_mem) {
   int max_m_blocks = 4;
   while (max_m_blocks > 0) {
+    // prob_m是A矩阵的行数
     if (prob_m <= 16) {
       for (auto th_config : small_batch_thread_configs) {
         if (is_valid_config(th_config, max_m_blocks, prob_m, prob_n, prob_k,
@@ -1974,11 +2065,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
   // TODO: remove alias when we start supporting other 8bit types
   int num_bits = q_type.size_bits();
   int tot_m = prob_m;
-  int tot_m_blocks = div_ceil(tot_m, 16);
-  int pad = 16 * tot_m_blocks - tot_m;
+  int tot_m_blocks = div_ceil(tot_m, 16); // 除以16，向上取整，表示为m方向的小tile数量，小tile为16x16.
+  int pad = 16 * tot_m_blocks - tot_m;    // 无法凑整的部分补0
 
   if (sms == -1) {
-    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev); // 获取sm个数，一个sm分配一个block
   }
 
   int max_shared_mem = 0;
@@ -2012,14 +2103,19 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
               ", has_act_order = ", has_act_order, ", is_k_full = ", is_k_full,
               ", max_shared_mem = ", max_shared_mem);
 
-  int num_threads = exec_cfg.tb_cfg.num_threads;
+  int num_threads = exec_cfg.tb_cfg.num_threads; // 一个block的线程数量，是256或128，对应8个/4个warp
   thread_k = exec_cfg.tb_cfg.thread_k;
   thread_n = exec_cfg.tb_cfg.thread_n;
 
-  int thread_k_blocks = thread_k / 16;
-  int thread_n_blocks = thread_n / 16;
-
-  int blocks = sms;
+  // 线程布局是<<<sm, num_thread>>>, 跟 thread_k 和 thread_n 无关。
+  // thread_k和thread_n表示一个大分块的大小，下面的for循环，每次处理一块。
+  // 小分块是16x16，则thread_k_blocks和thread_n_blocks表示小分块的个数。
+  int thread_k_blocks = thread_k / 16; 
+  int thread_n_blocks = thread_n / 16; 
+ 
+  // block数量设为与sm数量一致，本质上计算时就是一个sm一次只能调度一个block。
+  // 直接使用逻辑合理的给这些block分配任务，而不必要增加无法并行的block。
+  int blocks = sms; 
 
   TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
               " is not divisible by thread_n = ", thread_n);
@@ -2060,7 +2156,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
 
   int* locks = (int*)workspace;
 
-  if (has_act_order) {
+  // awq里为False
+  if (has_act_order) { 
     // Permute A columns
     int block_rows = div_ceil(prob_m, blocks);
     permute_cols_kernel<<<blocks, default_threads, 0, stream>>>(
@@ -2119,12 +2216,41 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
                   ", num_bits = ", num_bits);
     }
 
-    A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par;
-    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par;
+    A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par; // 按行跳跃，16*thread_m_blocks为行号，(prob_k / 8) * par为一行元素个数
+    C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par; 
   }
 }
 
 }  // namespace marlin
+
+// gptq_marlin_gemm / marlin_mm / Marlin
+// 
+// A：fp16的激活值[m,k]
+// B：int4量化后的权重[k,n]
+// C: fp16的输出[m,n]
+// max_par: 并行计算64行A矩阵的最大并行数, 
+// workspace: model_executor\layers\quantization\gptq_marlin.py#281
+//   用来做global_reduce的标志位，shape为[n/GPTQ_MARLIN_MIN_THREAD_N(64) * GPTQ_MARLIN_MAX_PARALLEL(16)]
+//   按n维度切分，N上最少线程数是64，则最多切分为N/64，再乘以最大并行数，即最多有N/64*16个slice，每个slice需要一个标志位。
+// b_scales[k/groupsize，n]: fp16量化的scale值。b_scales.size(0)是num_groups; b_scales.size(1)等于size_n，group_size=size_k/num_groups;
+// b_zeros[(k/groupsize),(n/pack_factor)]，has_zp: 
+//                 4bit的zero-points。 在awq上has_zp为True，即有自己的零点；
+//                 gptq上has_zp为False，即零点被固定，权重为int4时，零点固定为8，int8时为128？
+// pack_factor: 8 = 32 / b_q_type->size_bits()，用于int32和int4之间的下标索引转换。1个int32=8个int4，用int32指针索引时，下标需要除以8.
+//
+// 以Qwen2-1.5B-Instruct-AWQ为例，查看config.json可看到其group_size为128，继而打印其safetensors，可看到如下维度信息。
+// B[8960,192]的int32，其实际类型是int4，所以实际维度是B[8960, 1536=192*8]; 
+// 同样qzeros也是int4用int32来存储，其维度为[70, 1536=192*8]，其中行是70*group_size(128)=权重的size_k(8960); scales与qzeros元素个数是一样的。
+//
+// model.layers.9.mlp.down_proj.qweight torch.Size([8960, 192]) torch.int32
+// model.layers.9.mlp.down_proj.qzeros torch.Size([70, 192]) torch.int32
+// model.layers.9.mlp.down_proj.scales torch.Size([70, 1536]) torch.float16
+//
+// is_k_full: 在awq中被写死为True，在gptq中为可选。(vllm\model_executor\layers\quantization\utils\marlin_utils.py#300)
+//            为True时，表示权重矩阵B的行没有被排序。
+// g_idx / perm：Handle sorting for activation reordering if needed. (model_executor\layers\quantization\gptq_marlin.py#286)
+//               在awq_marlin的调用中为空，不做考虑 (vllm\model_executor\layers\quantization\awq_marlin.py#266)
+// use_fp32_reduce: 默认为True, 表示使用fp32的矩阵对最后完成分块计算时，对各分块结果进行规约。
 
 torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
                                torch::Tensor& b_scales, torch::Tensor& b_zeros,
@@ -2191,6 +2317,7 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
   torch::Tensor c = torch::empty({size_m, size_n}, options);
   torch::Tensor a_tmp = torch::empty({size_m, size_k}, options);
 
+  // 用于最后的分块结果规约
   // Alloc C tmp buffer that is going to be used for the global reduce
   int reduce_max_m = marlin::determine_reduce_max_m(size_m, marlin::max_par);
   int reduce_n = size_n;
@@ -2221,13 +2348,13 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
   // Detect groupsize and act_order
   int num_groups = -1;
   int group_size = -1;
-  bool has_act_order = g_idx.size(0) != 0;
+  bool has_act_order = g_idx.size(0) != 0; // awq中为False，gptq中可选
 
   int rank = b_scales.sizes().size();
   TORCH_CHECK(rank == 2, "b_scales rank = ", rank, " is not 2");
   TORCH_CHECK(b_scales.size(1) == size_n, "b_scales dim 1 = ", b_scales.size(1),
               " is not size_n = ", size_n);
-  num_groups = b_scales.size(0);
+  num_groups = b_scales.size(0); // 分组量化，scale和zero的行数即是group的数量
 
   if (has_act_order) {
     if (is_k_full) {

@@ -51,7 +51,24 @@ from vllm.sequence import IntermediateTensors
 from .interfaces import SupportsLoRA
 from .utils import is_pp_missing_parameter, make_layers
 
-
+# 在下面 Qwen2DecoderLayer 中充当成员 self.mlp
+# forward 计算过程是：
+# model_executor/layers/linear.py -> MergedColumnParallelLinear
+# model_executor/layers/activation.py -> SiluAndMul
+# model_executor/layers/linear.py -> RowParallelLinear
+#
+# 注意linear层的基类(LinearBase)中会用到get_quant_method，如设置的是awq_marlin，就会调用model_executor/layers/quantization/awq_marlin.py，
+# 而子类(ReplicatedLinear / ColumnParallelLinear / RowParallelLinear)会self.quant_method.apply, 进而调用相应的gemm kernel
+# awq_marlin中调用的gemm也是 gptq_marlin_gemm (见layers/quantization/utils/marlin_utils.py#apply_awq_marlin_linear)
+# apply_awq_marlin_linear 和 apply_gptq_marlin_linear 均调用 gptq_marlin_gemm 只是输入参数有点不同。
+# gptq_marlin_gemm kernel 见 csrc/quantization/gptq_marlin/gptq_marlin.cu。
+#
+# llm中常见的liner层(线程变换): fc层，投影层(Projection Layer)，词嵌入层(Embedding Layer)
+# 投影层：将高维的输入向量投影到低维空间或特定的特征空间，可以用于降低输入的维度，减少计算量和参数数量，同时保留重要的特征信息。
+#        在多头注意力机制中，投影层用于将输入向量投影到不同的注意力头的查询（Query）、键（Key）和值（Value）空间，以便进行注意力计算。
+# 词嵌入层：将离散的词汇或符号映射为连续的向量表示，即词向量。这些词向量可以捕捉词汇的语义信息和上下文关系。
+#          在 LLM 中，Embedding 层通常作为模型的第一层，将输入的文本序列中的每个词汇转换为对应的词向量，以便后续的处理和建模。
+#          可以通过预先训练好的词向量矩阵进行初始化，也可以在模型训练过程中与其他层一起进行学习和优化。
 class Qwen2MLP(nn.Module):
 
     def __init__(
@@ -81,7 +98,21 @@ class Qwen2MLP(nn.Module):
         x, _ = self.down_proj(x)
         return x
 
-
+# 在下面 Qwen2DecoderLayer 中充当成员 self.self_attn
+# forward 计算过程是：
+# model_executor/layers/linear.py -> QKVParallelLinear
+# model_executor/layers/rotary_embedding.py -> RotaryEmbedding
+# attention/layer.py -> Attention 
+# model_executor/layers/linear.py -> RowParallelLinear
+#
+# Attention 里面主要有 get_attn_backend
+#      get_attn_backend: 实现后端选择规则在 which_attn_to_use，英伟达平台下默认使用flash attention，如不满足要求则选择使用xformers。
+#           flash attention只在GPU设备能力大于8（Volta和Turing都是在8以下，Ampere和Hopper在8以上）
+#           且只支持fp16计算，不支持fp8 KV cache，block size要能被16整除（block_size: Size of a cache block in number of tokens）,
+#           不支持sliding_window。
+#      在flash attention (attention/backends/flash_attn.py)下，会调用flash_attn_varlen_func和flash_attn_with_kvcache，其函数在vllm_flash_attn的python包中。
+#      在xformers (attention/backends/xformers.py)下，会调用page attention(attention/ops/paged_attn.py), 其kernel在csrc/attention/attention_kernels.cu中。
+#      
 class Qwen2Attention(nn.Module):
 
     def __init__(self,
@@ -158,7 +189,12 @@ class Qwen2Attention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-
+# 在下面 Qwen2Model 中充当成员 self.layers
+# forward 计算过程是：
+# model_executor/layers/layernorm.py -> RMSNorm
+# self.self_attn 即上面的Qwen2Attention
+# model_executor/layers/layernorm.py -> RMSNorm
+# self.mlp 即上面的Qwen2MLP
 class Qwen2DecoderLayer(nn.Module):
 
     def __init__(
@@ -220,7 +256,11 @@ class Qwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
-
+# 在下面 Qwen2ForCausalLM 中充当成员 self.model
+# forward 计算过程是：
+# model_executor/layers/vocab_parallel_embedding.py -> VocabParallelEmbedding
+# 多个 Qwen2DecoderLayer
+# model_executor/layers/layernorm.py -> RMSNorm
 class Qwen2Model(nn.Module):
 
     def __init__(
@@ -289,7 +329,24 @@ class Qwen2Model(nn.Module):
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
-
+# Qwen2模型对外提供计算的外层接口
+# 包含：1. load_weights
+#      2. 上面Qwen2Model，在forward计算时会调用到。
+#      3. compute_logits: model_executor/layers/logits_processor.py -> LogitsProcessor
+#      4. sample: model_executor/layers/sampler.py -> Sampler
+#
+# Qwen2ForCausalLM 会由 输入指定的“qwen2”字符串索引到。
+# 链路为 
+#   (model_executor\model_loader\__init__.py)
+#       get_model ->  
+#   (model_executor\model_loader\loader.py):
+#       get_model_loader -> load_model -> _initialize_model#161 -> 
+#   (model_executor\model_loader\utils.py):
+#       get_model_architecture#21 -> 
+#   (model_executor\models\__init__.py):
+#       ModelRegistry.resolve_model_cls -> ModelRegistry._try_load_model_cls -> ModelRegistry._get_model -> _MODELS
+#
+# 在worker/model_runner.py 中调用 get_model 来使用。
 class Qwen2ForCausalLM(nn.Module, SupportsLoRA):
     packed_modules_mapping = {
         "qkv_proj": [

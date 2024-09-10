@@ -27,7 +27,25 @@ from vllm.utils import Counter, deprecate_kwargs, is_list_of
 
 logger = init_logger(__name__)
 
-
+# 模块顺序: entrypoints -> engine (最外层逻辑处理)
+#                                -> executor（设备平台划分，主要围绕worker执行） 
+#                                            -> worker (设备资源管理，模型外调度，分布式)
+#                                                      -> model_executor (具体模型计算)
+# LLM.__init__
+# 根据输入参数创建engine：LLMEngine.from_engine_args (engine\llm_engine.py)
+#    -> 创建配置参数：create_engine_config(engine\arg_utils.py)，
+#                   会得到DeviceConfig/ModelConfig/CacheConfig/ParallelConfig/SpeculativeConfig/SchedulerConfig/
+#                   LoRAConfig/LoadConfig/PromptAdapterConfig/DecodingConfig/ObservabilityConfig，最后打包成EngineConfig
+#    -> 根据EngineConfig创建engine：_get_executor_cls， 如无特殊要求，英伟达gpu的会默认选择使用GPUExecutor (engine\llm_engine.py#406)
+#    --> 在创建executor时会执行_create_worker() / init_device() 和 load_model() (executor\gpu_executor.py#31)
+#    ---> self.driver_worker = self._create_worker(): 通过WorkerWrapperBase构建worker (worker/worker.py)
+#    ---> self.driver_worker.init_device()
+#    ---> self.driver_worker.load_model()：通过model_runner去load_model(worker/worker.py)，
+#                                                               ->loader 
+#                                                                    -> _initialize_model 与 (vllm\model_executor\models\qwen2.py)衔接, 在qwen2.py中搜索_initialize_model查看
+#                                                                       接上qwen2模型后，由其模型实现调用计算。
+# model_runner，共分两类：embedding_model/enc_dec_model_runner(worker/model_runner.py)
+# 
 class LLM:
     """An LLM for generating texts from given prompts and sampling parameters.
 

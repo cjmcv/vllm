@@ -53,11 +53,19 @@ inline __device__ float block_sum(float* red_smem, float sum) {
   int lane = threadIdx.x % WARP_SIZE;
 
   // Compute the sum per warp.
+  // __shfl_xor_sync为warp级别异或函数，使用异或操作来获取对应目标的值。
+  // 如lane_mask为16，表示lane0可以拿到lane16的值作为函数返回值，lane1对应lane17，lane2对应lane18等。
+  // 如lane0和lane16，初始时都分别有个自己对应的sum值，当这两个线程进入到函数内时，里面会根据lane_mask==16进行处理，
+  // 把lane16的sum值传到lane0中，以函数返回值传出。所以直接用lane0用自己的sum值去累加__shfl_xor_sync的返回值，就能得到lane0=lane0+lane16。
+  // 同一时刻，lane1=lane1+lane17；lane2=lane2+lane18...；lane15=lane15+land31；完成for循环里的一次处理；
+  // 下一次，mask除以2等于8，则lane0对应lane8；直到循环结束，最后一次是lane0对应lane1的相加；
+  // 循环结束后，lane0可拿到整个warp的32个线程对应各自的sum值的累加值，完成warp内的规约。
 #pragma unroll
   for (int mask = WARP_SIZE / 2; mask >= 1; mask /= 2) {
     sum += VLLM_SHFL_XOR_SYNC(sum, mask);
   }
 
+  // 同时，每个warp的lane0都拿到了自己所在warp的规约值，由lane0负责统一放到smem数组中。至此数组需要规约的数据减少了16倍。
   // Warp leaders store the data to shared memory.
   if (lane == 0) {
     red_smem[warp] = sum;
@@ -66,6 +74,9 @@ inline __device__ float block_sum(float* red_smem, float sum) {
   // Make sure the data is in shared memory.
   __syncthreads();
 
+  // 将数据从smem填回到线程中，再按上面的方式规约一次。
+  // 因lane最大是31，NUM_WARPS大于32的部分将不处理，而32*32=1024，即一个block的线程数量不应超过1024个线程。
+  // 此时一个block只有red_smem的NUM_WARPS个数据，按lane重填回线程后，每个warp的数据其实是一样的。
   // The warps compute the final sums.
   if (lane < NUM_WARPS) {
     sum = red_smem[lane];
@@ -77,7 +88,10 @@ inline __device__ float block_sum(float* red_smem, float sum) {
     sum += VLLM_SHFL_XOR_SYNC(sum, mask);
   }
 
-  // Broadcast to other threads.
+  // 至此，lane0的sum就是一个warp里新数据的累加值，也就是一个block里所有数据的累加值，
+  // 且因每个warp的数据一样，即每个warp里的lane0的值都一样是block的总累加值。
+  // 将lane0的sum值广播到warp内的其他线程中。使所有线程的sum值都是线程所在block的累加值。
+  // Broadcast to other threads. 返回值就是广播的值
   return VLLM_SHFL_SYNC(sum, 0);
 }
 
