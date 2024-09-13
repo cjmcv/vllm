@@ -35,7 +35,7 @@ static constexpr int repack_stages = 8;
 
 static constexpr int repack_threads = 256;
 
-// int4数据的tile_shape[16, 64]: 针对权重矩阵B进行分块
+// tile_shape[16, 64]: 针对权重矩阵B进行分块
 static constexpr int tile_k_size = tile_size;
 static constexpr int tile_n_size = tile_k_size * 4;
 

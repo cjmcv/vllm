@@ -20,18 +20,44 @@
  */
 
 // marlin kernel实现的是一个fp16 A x int4/int8 B = fp16 C的混合精度的gemm.
+// 一般W4A16的发力点是在batchsize很小的情况，这时的gemm将会处于访存受限状态，w4理论上能够达到4倍fp16的效果。
+// 所以这个kernel设计关键点在于如何让 计算时延在访存时延下能够隐藏起来。
+// 
 // 主要围绕着16x8x16的fp16 mma进行计算，即一次mma为A[16,16] x B[16,8] = C[16,8]。
 // 子块划分为[16,16]，按n方向两次mma来完成A[16,16] x B[16,16] = C[16,16]
 
 // 以int4为例:
 // 1. 在模型加载后，权重矩阵 B 会做一次repack：
-//     1) 针对[16, 16]分块, 将维度排布成[k/16, n*16]，使16x16子块排成一行。用途？
+//     1) 针对[16, 16]分块, 将维度排布成[k/16, n*16]，使16x16子块排成一行。
 //     2) 将子块元素按列混插方式排布，因为gemm里采用的是fp16计算，而B矩阵是int4，
 //         在计算之前会涉及到反量化操作，需要对用int32存储的8个int4分别进行拼凑，
 //         则需要将相邻的两个int4分别划分到高16位和低16位中，便于在mask后直接进反量化操作。
 //     3) 因为B矩阵是int4，涉及到unpack和反量化，无法使用ldmatrix进行读取，
 //         所以将子块元素顺序进行按ldmatrix B矩阵的格式进行排布，达到ldmatrix.trans的效果，在反量化后可直接用到mma中。
-// 2. gemm
+// 2. gemm 
+//    线程分配：block的数量=sm数量，因为GPU调度器把线程块逐个分配到SM上（一个Block只能在一个SM中，且一个SM包含多个Block），
+//           可以让block和sm一一对应，可以在代码层面上让每个sm都有较明确的任务，间接参与了对sm的调度。
+//             每个block的线程数量=256/128，一般会选择256，也就是8个warp，因为每个SM都有4个warp调度器，
+//           每个调度器有多于1个warp可以让它有更多的调度空间，也不能设置太多，会减少每个warp可用的寄存器数量。
+//             为什么留有128的选项：n和k分块维度要能被n和k整除，如不能，则减小分块维度，同时线程数也对应减少。线程数和分块维度的关系？
+//    分块层次：》kernel级别分层：m方向对A和C矩阵进行一个切分，循环中会根据当前需要计算的行数launch一个新的kernel进行计算。
+//              （即它会更倾向于小batchsize的情况进行优化，也比较符合w4a16的应用场合，因为batchsize上去之后，会转为计算受限。
+//                此时瓶颈将会是反量化和fp16的mma，到时这版marlin kernel的收益也不会很好）
+//             》block级别分块：k和n方向的切分根据m的总行数来设定，m较小时一般设为128*128，m较大时一般设为64*256。
+//             》warp级别分块：warp级别分块为16x16x16, 由两条16x8x16的mma组成。
+//    优化点归纳：
+//             1）全局内存访问基本以8个fp16(int4)为单位进行，与cp.async指令的最大拷贝数量一致，也满足合并访问要求。
+//             2）采用的Stream-K方式进行，提高了数据局部性，也避免了矩阵太大资源不够的情况。
+//             3) block swizzle，一维block索引转二维，约束sm的执行范围，将成行改为成块，分片计算，提高L2命中率。
+//             4) 4级流水线 / 异步拷贝 / 双缓存来进行数据预取，隐藏拷贝和计算的等待延迟.
+//                为什么是4级？资源和收益的权衡，profile得出？
+//             5）ldmatrix读取的是8x8的矩阵，正常访问会存在bank冲突, 通过异或做swizzle, 达到读写的conflict free。
+//                这个操作是以前在cutlass中提出了，现在被广泛使用了。
+//             6）内层调用mma的两层循环，外层是B矩阵n方向的4个16x16，内层是m方向所有数据，每次调用两次mma。
+//                反量化在较外层，减少反量化次数。
+//                每次选取B矩阵4份tile：因为每个线程负责32个fp16(一次2个frag，一个frag有4个fp16，),32x32=4x16x16，warp里每个线程都在工作状态。
+//             7) 规约：mma输出c矩阵为fp32，则顺势在寄存器上进行fp32的规约，最后以rf->smem(fp32->fp16/重排)->gmem的流程写出去。
+//                （为什么不直接从rf到gmem，因为数据不连续，无法合并访问，经过smem重排后，可以合并写入到gmem）
 
 #include "marlin.cuh"
 #include "marlin_dtypes.cuh"
@@ -121,7 +147,7 @@ torch::Tensor gptq_marlin_gemm(torch::Tensor& a, torch::Tensor& b_q_weight,
 // C矩阵写法与A矩阵一致，但C矩阵列方向少了一半数据为上下2份8*8，先写左上2数据，再写左下2数据，共4个。
 // B矩阵按列优先写入，同分上下两块，先写上面的2数据，再写下面2数据，先递增列。
 //
-// 以t0为例，将会得到A矩阵的[0,0], [0,1], [8,0], [8,1], [0,8], [0,9], [8,8], [8,9]
+// 以t0为例，将会提供A矩阵的[0,0], [0,1], [8,0], [8,1], [0,8], [0,9], [8,8], [8,9]
 //                  B矩阵的[0,0], [1,0], [8,0], [9,0]
 //                  C矩阵的[0,0], [0,1], [8,0], [8,1]
 // A和B的数据并不能直接计算得到C的数据。为什么数据这么排布，原因在于该指令会跟ldmatrix进行搭配使用，ldmatrix读取出来后可以直接进入mma指令。
@@ -650,15 +676,16 @@ __global__ void Marlin(
 
   // For larger GEMMs we run multiple batchsize 64 versions in parallel for a
   // better partitioning with less reductions
-  // 在m维度上进行拆分，
+  // 重新把并行数算出来，prob_m改回大分块的维度，进行计算
   int parallel = 1;
   if (prob_m > 16 * thread_m_blocks) {
-    parallel = prob_m / (16 * thread_m_blocks);
+    parallel = prob_m / (16 * thread_m_blocks); // 这里的并行数，即是m方向切分后，进入该kernel的矩阵的基础上，m方向的大分块的数量
     prob_m = 16 * thread_m_blocks;
   }
 
-  int k_tiles = prob_k / 16 / thread_k_blocks;
-  int n_tiles = prob_n / 16 / thread_n_blocks;
+  int k_tiles = prob_k / 16 / thread_k_blocks; // k方向 大分块的数量 即block tile
+  int n_tiles = prob_n / 16 / thread_n_blocks; // n方向 大分块的数量
+  // 每个block需要处理大分块的数量：gridDim.x即是block的数量，所有方向大分块block tile的数量乘积 除以 block数量，向上取整
   int iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
 
   if constexpr (!has_act_order && group_blocks != -1) {
@@ -671,6 +698,17 @@ __global__ void Marlin(
     }
   }
 
+  // 使用 % 和 / 的组合，将一维的blockIdx.x转变为二维索引, %用于行索引，则表示列优先，遍历完一列再下一列
+  // * 假设iters为1，围绕k_tiles=5进行排布，blockIdx.x[slice_row, slice_col_par]
+  //   则有 0[0,0], 1[1,0], 2[2,0], 3[3,0], 4[4,0], 
+  //        5[0,1], 6[1,1], 7[2,1]...
+  // * 如果1个block处理两个大块，即iters为2, x[2x%5,2x/5]
+  //   则有 0[0,0], 1[2,0], 2[4,0], 3[1,1], 4[3,1]
+  // * 如果1个block处理三个大块，即iters为3, x[3x%5,3x/5]
+  //   则有 0[0,0], 1[3,0], 2[1,1]
+  // 即会按k_tiles为一列的行数，按顺序分配给各个block指定二维首地址，
+  // 如iters为3，则0行的[0,0][1,0][2,0]都归0号，[3,0][4,0][0,1]都归1号，
+  // 而都归一个block的大块(threadblock tiles)集合算是一个slice，如[0,0][1,0][2,0]
   int slice_row = (iters * blockIdx.x) % k_tiles;
   int slice_col_par = (iters * blockIdx.x) / k_tiles;
   int slice_col = slice_col_par;
@@ -682,13 +720,16 @@ __global__ void Marlin(
 
   int par_id = 0;
 
+  // n_tiles是n方向block tile的数量，slice_col_par是n方向block tile的下标。
+  // 如果列数大于等于n_tiles，即表示超出范围了？slice_col_par最大应该是最后一个block负责的第一个block tile，应比n_tiles小？
+  // 暂时忽略这里
   // We can easily implement parallel problem execution by just remapping
   // indices and advancing global pointers
   if (slice_col_par >= n_tiles) {
     A += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_k / 8;
     C += (slice_col_par / n_tiles) * 16 * thread_m_blocks * prob_n / 8;
     locks += (slice_col_par / n_tiles) * n_tiles;
-    slice_col = slice_col_par % n_tiles;
+    slice_col = slice_col_par % n_tiles; // 因为iters是向上取整得到的，所以有可能会大于n_tiles，取余得到剩余的部分。
     par_id = slice_col_par / n_tiles;
   }
 
@@ -727,9 +768,9 @@ __global__ void Marlin(
 
   // A sizes/strides
 
-  // stride of the A matrix in global memory
+  // stride of the A matrix in global memory，a矩阵gmem的下标索引：将fp16改为int4索引
   int a_gl_stride = prob_k / 8;
-  // stride of an A matrix tile in shared memory
+  // stride of an A matrix tile in shared memory，a矩阵smem的下标索引，16*thread_k_blocks是block tile的线程数，除以8是将fp16下标转为int4
   constexpr int a_sh_stride = 16 * thread_k_blocks / 8;
   // delta between subsequent A tiles in global memory
   constexpr int a_gl_rd_delta_o = 16 * thread_k_blocks / 8;
@@ -882,6 +923,9 @@ __global__ void Marlin(
   // Since the computation of this remapping is non-trivial and, due to our main
   // loop unrolls, all shared memory accesses are static, we simply precompute
   // both transformed reads and writes.
+  // a_sh_wr_trans和a_sh_rd_trans存储的都是共享内存里A矩阵的转换后的偏移量。
+  // a_sh_wr_trans用于从gmem到smem
+  // a_sh_rd_trans用于从smem到rf
   int a_sh_wr_trans[a_sh_wr_iters];
   #pragma unroll
   for (int i = 0; i < a_sh_wr_iters; i++)
@@ -895,6 +939,9 @@ __global__ void Marlin(
           transform_a(a_sh_rd_delta_o * i + a_sh_rd_delta_i * j + a_sh_rd);
   }
 
+  // 因为B矩阵的访问并不是固定步长的，所以需要在计算过程中计算。
+  // 这里通过维护多个指针，来去掉访问一个tile时，多次连续访问之间的依赖关系。
+  // 即一个tile的读取，每行其实是分布在多个不同位置的，没必要访问完第一行再计算下一行的位置继续访问。
   // Since B-accesses have non-constant stride they have to be computed at
   // runtime; we break dependencies between subsequent accesses with a tile by
   // maintining multiple pointers (we have enough registers), a tiny
@@ -906,8 +953,8 @@ __global__ void Marlin(
 
   extern __shared__ int4 sh[];
   // Shared memory storage for global fetch pipelines.
-  int4* sh_a = sh;
-  int4* sh_b = sh_a + (stages * a_sh_stage);
+  int4* sh_a = sh;                           // [stages * a_sh_stage]
+  int4* sh_b = sh_a + (stages * a_sh_stage); // [stages * b_sh_stage] = [4*]
   int4* sh_g_idx = sh_b + (stages * b_sh_stage);
   int4* sh_zp = sh_g_idx + (stages * g_idx_stage);
   int4* sh_s = sh_zp + (stages * zp_sh_stage);
@@ -1287,6 +1334,7 @@ __global__ void Marlin(
 
   // We have the m dimension as the inner loop in order to encourage overlapping
   // dequantization and matmul operations.
+  // b矩阵一个线程for循环4次，每次读取2份frag，一份frag有4个fp16，即每个线程负责32个fp16，32个线程共1024=32(warp)x32=4x16x16个fp16
   #pragma unroll
     for (int j = 0; j < 4; j++) {
       FragB frag_b0;
@@ -1625,7 +1673,8 @@ __global__ void Marlin(
     // ensure all shared memory accesses are static. Note that both pipelines
     // have even length meaning that the next iteration will always start at
     // index 0.
-
+    // 循环展开global fetch和寄存器加载pipeline，以确保所有共享内存访问都是静态的。
+    // 请注意，这两个pipeline的长度是相等的，这意味着下一次迭代将始终从索引0开始。
   #pragma unroll
     for (int pipe = 0; pipe < stages;) {
   #pragma unroll
@@ -1815,8 +1864,14 @@ typedef struct {
   thread_config_t tb_cfg;
 } exec_config_t;
 
+// 优先采用256线程一个block，因为256个线程有8个warp。
+// （费米架构只有2个？）volta/安倍架构，每个SM都有4个warp调度器，每个调度器里有超过1个warp可以隐藏更多的延迟。
+// 但warp又不能太多，希望相对较少的warp，使每个warp和小分块上有更多寄存器可用
+// m小的情况下选[128,128]; 
+// m大时选[64,256]，总数都是16384 = 64*256 = 128*128
 thread_config_t small_batch_thread_configs[] = {
     // Ordered by priority
+    // For small batchizes, better partioning is slightly more important than better compute utilization
 
     // thread_k, thread_n, num_threads
     {128, 128, 256},
@@ -2108,13 +2163,13 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
   thread_n = exec_cfg.tb_cfg.thread_n;
 
   // 线程布局是<<<sm, num_thread>>>, 跟 thread_k 和 thread_n 无关。
-  // thread_k和thread_n表示一个大分块的大小，下面的for循环，每次处理一块。
+  // thread_k和thread_n表示一个大分块的大小，（下面的for循环，每次处理一块？）
   // 小分块是16x16，则thread_k_blocks和thread_n_blocks表示小分块的个数。
   int thread_k_blocks = thread_k / 16; 
   int thread_n_blocks = thread_n / 16; 
  
   // block数量设为与sm数量一致，本质上计算时就是一个sm一次只能调度一个block。
-  // 直接使用逻辑合理的给这些block分配任务，而不必要增加无法并行的block。
+  // 直接使用逻辑，合理的给这些block分配任务，而不必要增加无法并行的block。
   int blocks = sms; 
 
   TORCH_CHECK(prob_n % thread_n == 0, "prob_n = ", prob_n,
@@ -2123,7 +2178,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
               " is not divisible by thread_k = ", thread_k);
 
   int group_blocks = 0;
-  if (has_act_order) {
+  if (has_act_order) { // awq False
     if (is_k_full) {
       TORCH_CHECK(group_size != -1);
       group_blocks = group_size / 16;
@@ -2144,15 +2199,15 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
     }
   }
 
-  const int4* A_ptr = (const int4*)A;
-  const int4* B_ptr = (const int4*)B;
-  int4* C_ptr = (int4*)C;
-  int4* C_tmp_ptr = (int4*)C_tmp;
-  const int4* s_ptr = (const int4*)s;
-  const int4* zp_ptr = (const int4*)zp;
-  const int* g_idx_ptr = (const int*)g_idx;
-  const int* perm_ptr = (const int*)perm;
-  int4* a_tmp_ptr = (int4*)a_tmp;
+  const int4* A_ptr = (const int4*)A; // fp16
+  const int4* B_ptr = (const int4*)B; // int4
+  int4* C_ptr = (int4*)C;             // fp16
+  int4* C_tmp_ptr = (int4*)C_tmp;     // fp32
+  const int4* s_ptr = (const int4*)s; // fp16
+  const int4* zp_ptr = (const int4*)zp;  // int4
+  const int* g_idx_ptr = (const int*)g_idx; // swq 无
+  const int* perm_ptr = (const int*)perm;   // awq 无
+  int4* a_tmp_ptr = (int4*)a_tmp;        // fp16
 
   int* locks = (int*)workspace;
 
@@ -2174,15 +2229,15 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
 
   // Main loop
   for (int i = 0; i < tot_m_blocks; i += exec_cfg.max_m_blocks) {
-    int thread_m_blocks = tot_m_blocks - i;
-    prob_m = tot_m - 16 * i;
-    int par = 1;
-    if (thread_m_blocks > exec_cfg.max_m_blocks) {
+    int thread_m_blocks = tot_m_blocks - i;  // 剩余的tile数量 = m方向的总tile[16,16]个数 - 当前到第i的tile
+    prob_m = tot_m - 16 * i;                 // 剩余行数 = 总行数 - 16x当前tile数
+    int par = 1;                             // 先令并行度为1
+    if (thread_m_blocks > exec_cfg.max_m_blocks) {   // max_m_blocks 是按资源情况和布局计算过的一次处理最大的分块数量
       // Note that parallel > 1 currently only works for inputs without any
       // padding
-      par = (16 * thread_m_blocks - pad) / (16 * exec_cfg.max_m_blocks);
-      if (par > max_par) par = max_par;
-      prob_m = (16 * exec_cfg.max_m_blocks) * par;
+      par = (16 * thread_m_blocks - pad) / (16 * exec_cfg.max_m_blocks); // 看按最大的max_m_blocks，可以并行执行多少份
+      if (par > max_par) par = max_par;     // 限制最大并行数量
+      prob_m = (16 * exec_cfg.max_m_blocks) * par; // 按新的并行数量调整当前轮次需要处理的prob_m行
       i += exec_cfg.max_m_blocks * (par - 1);
       thread_m_blocks = exec_cfg.max_m_blocks;
     }
@@ -2216,7 +2271,11 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
                   ", num_bits = ", num_bits);
     }
 
-    A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par; // 按行跳跃，16*thread_m_blocks为行号，(prob_k / 8) * par为一行元素个数
+    // 按行跳跃，A_ptr指向某行首地址
+    // thread_m_blocks为一个16x16的tile在m方向的个数，16*thread_m_blocks转换为元素个数，par为并行数，如2则直接处理两份；
+    // 16 * thread_m_blocks * par得到行号；prob_k为一行元素个数，A_ptr的元素为fp16，prob_k表示有这么多个fp16，
+    // 而指针为int4*，注意这里的int4并不是4bit的int，而是4个int，即8个fp16，所以基于int4*去索引，需要除以8.
+    A_ptr += 16 * thread_m_blocks * (prob_k / 8) * par; 
     C_ptr += 16 * thread_m_blocks * (prob_n / 8) * par; 
   }
 }
@@ -2244,7 +2303,7 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* s,
 //
 // model.layers.9.mlp.down_proj.qweight torch.Size([8960, 192]) torch.int32
 // model.layers.9.mlp.down_proj.qzeros torch.Size([70, 192]) torch.int32
-// model.layers.9.mlp.down_proj.scales torch.Size([70, 1536]) torch.float16
+// model.layers.9.mlp.down_proj.scales torch.Size([70, 1536]) torch.float16    size_k = 1536, 1536 / 8 = 192
 //
 // is_k_full: 在awq中被写死为True，在gptq中为可选。(vllm\model_executor\layers\quantization\utils\marlin_utils.py#300)
 //            为True时，表示权重矩阵B的行没有被排序。
